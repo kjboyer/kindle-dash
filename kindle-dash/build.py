@@ -791,8 +791,11 @@ def main():
     total = len(pages)
     for i, (name, fn) in enumerate(pages, 1):
         page = fn(i, total)
+        # Each page is also its own one-page PDF: KOReader's library treats it as a document (a tile on the
+        # home screen), whereas plain PNGs are not listed there.
+        name = name.replace(".png", ".pdf")
         path = os.path.join(a.out, name)
-        page.save(path)
+        page.im.save(path, "PDF", resolution=300.0, quality=95)
         pdf_pages.append(page.im)
         with open(path, "rb") as f:
             manifest["sha256"][name] = hashlib.sha256(f.read()).hexdigest()
