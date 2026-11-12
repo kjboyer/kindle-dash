@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the daily Kindle dashboard pages (1072x1448 greyscale PNGs).
 
-Pages: 01-today (weather, surf, tide) · 02-week · 03-calendar · 04-news
+Pages: 01-today (weather, surf, tide) · 02-week · 03-calendar · 04-school · 05-news · lock-01 (sleep screen)
 Writes the PNGs plus manifest.json into --out.
 
 Data sources (all public, no keys):  NWS (weather), NDBC buoy 46225 (surf),
@@ -91,8 +91,9 @@ def get_weather(now):
     if not fc:
         return None
     periods = fc["properties"]["periods"]
-    out = {"now": None, "days": [], "periods": periods}
+    out = {"now": None, "days": [], "periods": periods, "hourly": []}
     if hr:
+        out["hourly"] = _parse_hourly(hr["properties"]["periods"])
         p0 = hr["properties"]["periods"][0]
         out["now"] = {
             "temp": p0["temperatureUnit"] == "F" and p0["temperature"] or round(c_to_f(p0["temperature"])),
@@ -123,6 +124,64 @@ def get_weather(now):
                              "night_pop": 0, "night_cond": ""})
     out["days"] = days[:7]
     return out
+
+
+_DIR_DEG = {n: i * 22.5 for i, n in enumerate(
+    ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"])}
+
+
+def _parse_hourly(periods):
+    """NWS hourly periods -> [{t, temp, mph, deg}] (skips entries it cannot parse)."""
+    out = []
+    for p in periods:
+        try:
+            t = dt.datetime.fromisoformat(p["startTime"]).astimezone(TZ)
+            nums = [int(x) for x in re.findall(r"\d+", p.get("windSpeed", ""))]
+            temp = p["temperature"] if p.get("temperatureUnit", "F") == "F" else round(c_to_f(p["temperature"]))
+            out.append({"t": t, "temp": temp, "mph": max(nums) if nums else None,
+                        "deg": _DIR_DEG.get(p.get("windDirection", ""))})
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def best_window(weather, now, first_hr=6, last_hr=18):
+    """Best 2-hour daylight slot by wind (offshore counts as half as bad).
+    Looks at the rest of today; if less than 2 hours remain, tomorrow. Returns (start, end, avg_mph, offshore) or None."""
+    hours = (weather or {}).get("hourly") or []
+    def day_hours(day):
+        return [h for h in hours if h["t"].date() == day and first_hr <= h["t"].hour < last_hr
+                and h["mph"] is not None and h["t"] >= now.replace(minute=0, second=0, microsecond=0)]
+    for day in (now.date(), now.date() + dt.timedelta(days=1)):
+        hs = day_hours(day)
+        best = None
+        for a, b in zip(hs, hs[1:]):
+            if (b["t"] - a["t"]) != dt.timedelta(hours=1):
+                continue
+            offs = [h["deg"] is not None and 45 <= h["deg"] <= 135 for h in (a, b)]
+            cost = sum(h["mph"] * (0.5 if o else 1.0) for h, o in zip((a, b), offs)) / 2
+            if best is None or cost < best[0]:
+                best = (cost, a["t"], b["t"] + dt.timedelta(hours=1), (a["mph"] + b["mph"]) / 2, all(offs))
+        if best:
+            return best[1], best[2], best[3], best[4]
+    return None
+
+
+def surf_call(surf, window):
+    """One word: Flat / Poor / Fair / Good. Rough guide from buoy wave height and wind in the best window."""
+    if not surf or surf.get("ft") is None:
+        return None
+    h = surf["ft"]
+    if h < 1.5:
+        return "FLAT"
+    if window is None:
+        return "FAIR" if h >= 2.5 else "POOR"
+    _, _, mph, offshore = window
+    if offshore or mph <= 6:
+        return "GOOD" if h >= 2.5 else "FAIR"
+    if mph <= 12:
+        return "FAIR"
+    return "POOR"
 
 
 def rain_alert(weather, now):
@@ -259,25 +318,10 @@ def get_news(n=14):
 
 
 # --------------------------------------------------------------------------- data: calendar
-def get_calendar(now, days=4):
-    url = os.environ.get("CAL_ICS_URL", "").strip()
-    text = None
-    if FIXTURES:
-        text = fetch("calendar", "", "text")
-    elif url:
-        try:
-            r = requests.get(url, headers=UA, timeout=30)
-            r.raise_for_status()
-            text = r.text
-        except Exception as e:  # noqa: BLE001
-            print(f"[warn] calendar fetch failed: {type(e).__name__}", file=sys.stderr)  # never print the URL
-    if not text:
-        return None
+def _ics_events(text, start, end):
     import icalendar
     import recurring_ical_events
     cal = icalendar.Calendar.from_ical(text)
-    start = dt.datetime.combine(now.date(), dt.time.min, tzinfo=TZ)
-    end = start + dt.timedelta(days=days)
     evs = []
     for ev in recurring_ical_events.of(cal).between(start, end):
         s = ev.get("DTSTART").dt
@@ -296,6 +340,42 @@ def get_calendar(now, days=4):
                 d += dt.timedelta(days=1)
     evs.sort(key=lambda x: (x["day"], not x["all_day"], x["start"] or dt.datetime.min.replace(tzinfo=TZ)))
     return evs
+
+
+def _fetch_ics(name, url):
+    if FIXTURES:
+        return fetch(name, "", "text")
+    if not url:
+        return None
+    try:
+        r = requests.get(url, headers=UA, timeout=30)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {name} fetch failed: {type(e).__name__}", file=sys.stderr)  # never print the URL
+        return None
+
+
+def get_calendar(now, days=4):
+    text = _fetch_ics("calendar", os.environ.get("CAL_ICS_URL", "").strip())
+    if not text:
+        return None
+    start = dt.datetime.combine(now.date(), dt.time.min, tzinfo=TZ)
+    return _ics_events(text, start, start + dt.timedelta(days=days))
+
+
+# Hardy Elementary PTA calendar: a public Google Calendar feed published on the school's website
+# (https://hardy.sandiegounified.org/about/Calendar). Override with SCHOOL_ICS_URL if it ever moves.
+HARDY_ICS = ("https://calendar.google.com/calendar/ical/"
+             "c_13db74eb3070947ae2f7582121d55da21458e02993fa8cfcb97b5f45a0118d1f%40group.calendar.google.com/public/basic.ics")
+
+
+def get_school(now, days=60):
+    text = _fetch_ics("school", os.environ.get("SCHOOL_ICS_URL", "").strip() or HARDY_ICS)
+    if not text:
+        return None
+    start = dt.datetime.combine(now.date(), dt.time.min, tzinfo=TZ)
+    return _ics_events(text, start, start + dt.timedelta(days=days))
 
 
 # --------------------------------------------------------------------------- drawing helpers
@@ -555,6 +635,39 @@ def page_calendar(now, events, n, total):
     return p
 
 
+def page_school(now, events, n, total):
+    p = Page("HARDY ELEMENTARY", now, n, total)
+    if events is None:
+        p.unavailable(160, "School calendar")
+        p.footer("Hardy PTA calendar")
+        return p
+    p.text((48, 128), "UPCOMING", F("Bold", 26), fill=70)
+    y, last_day, rows = 170, None, 0
+    for e in events:
+        if rows >= 14 or y > 1250:
+            break
+        if e["day"] != last_day:
+            if last_day is not None:
+                y += 12
+            lab = "TODAY" if e["day"] == now.date() else ("TOMORROW" if e["day"] == now.date() + dt.timedelta(days=1)
+                                                          else e["day"].strftime("%a %b ") + str(e["day"].day))
+            p.text((48, y), lab.upper(), F("ExtraBold", 32))
+            y += 50
+            p.rule(y - 8, 2)
+            last_day = e["day"]
+        when = "All day" if e["all_day"] else fmt_time_short(e["start"]) + (("–" + fmt_time_short(e["end"])) if e["end"] else "")
+        p.text((48, y + 2), when, F("Bold", 26))
+        for i, ln in enumerate(p.wrap(e["title"], F("Medium", 30), W - 96 - 250, 2)):
+            p.text((300, y + i * 36), ln, F("Medium", 30))
+            y += 36 if i else 0
+        y += 46
+        rows += 1
+    if rows == 0:
+        p.text((48, 190), "No events in the next 60 days", F("Regular", 30), fill=90)
+    p.footer("Hardy PTA calendar (public) · check the school site for changes")
+    return p
+
+
 def page_news(now, items, n, total):
     p = Page("HACKER NEWS", now, n, total)
     if not items:
@@ -578,6 +691,65 @@ def page_news(now, items, n, total):
 
 
 # --------------------------------------------------------------------------- main
+def page_lock(now, weather, surf, tides):
+    im = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(im)
+    def T(xy, s, font, fill=0, anchor="la"):
+        d.text(xy, s, font=font, fill=fill, anchor=anchor)
+    window = best_window(weather, now)
+    call = surf_call(surf, window)
+    T((W // 2, 70), PLACE, F("ExtraBold", 44), anchor="ma")
+    d.rectangle([48, 135, W - 48, 139], fill=0)
+    # --- surf call
+    T((W // 2, 175), "SURF", F("Bold", 36), fill=60, anchor="ma")
+    T((W // 2, 215), call or "—", F("ExtraBold", 270), anchor="ma")
+    if window:
+        a, b = window[0], window[1]
+        sa = fmt_time_short(a).replace("a", "").replace("p", "") if a.strftime("%p") == b.strftime("%p") else fmt_time_short(a)
+        T((W // 2, 530), f"Best window  {sa}–{fmt_time_short(b)}", F("Bold", 54), anchor="ma")
+        wd = "offshore" if window[3] else "wind"
+        T((W // 2, 602), f"{round(window[2])} mph {wd}", F("Medium", 36), fill=60, anchor="ma")
+    elif call:
+        T((W // 2, 530), "No wind forecast available", F("Medium", 40), fill=60, anchor="ma")
+    if surf and surf.get("ft") is not None:
+        per = f' @ {surf["period"]:.0f}s' if surf.get("period") else ""
+        T((W // 2, 665), f'Swell {surf["ft"]:.1f} ft{per}', F("Medium", 40), anchor="ma")
+    d.rectangle([48, 740, W - 48, 743], fill=0)
+    # --- temps
+    air = weather["now"]["temp"] if weather and weather.get("now") else None
+    water = surf.get("water_f") if surf else None
+    col = [(W // 4, "AIR", f"{air}°" if air is not None else "—"),
+           (3 * W // 4, "WATER", f"{round(water)}°" if water is not None else "—")]
+    for x, label, val in col:
+        T((x, 775), label, F("Bold", 36), fill=60, anchor="ma")
+        T((x, 815), val, F("ExtraBold", 210), anchor="ma")
+    d.rectangle([W // 2 - 1, 790, W // 2 + 1, 1050], fill=0)
+    days = (weather or {}).get("days") or []
+    if days and days[0].get("hi") is not None and days[0].get("lo") is not None:
+        T((W // 4, 1060), f'High {days[0]["hi"]}°  ·  Low {days[0]["lo"]}°', F("Medium", 36), anchor="ma")
+    elif days and days[0].get("lo") is not None:
+        T((W // 4, 1060), f'Tonight low {days[0]["lo"]}°', F("Medium", 36), anchor="ma")
+    if weather and weather.get("now"):
+        T((W // 4, 1100), weather["now"]["cond"], F("Medium", 32), fill=60, anchor="ma")
+    if surf and surf.get("time"):
+        T((3 * W // 4, 1060), f'Buoy {fmt_time_short(surf["time"])}', F("Medium", 32), fill=60, anchor="ma")
+    # --- rain / tide
+    y = 1160
+    ra = rain_alert(weather, now)
+    if ra:
+        d.rectangle([48, y, W - 48, y + 100], outline=0, width=4)
+        T((72, y + 14), ra[0], F("ExtraBold", 34))
+        T((72, y + 56), ra[1], F("Medium", 28))
+        y += 125
+    if tides:
+        nxt = [p for p in tides if p[0] > now.replace(tzinfo=None)][:2]
+        if nxt:
+            parts = [f'{"High" if p[2] == "H" else "Low"} {fmt_time_short(p[0])} {p[1]:.1f} ft' for p in nxt]
+            T((W // 2, y + 10), "TIDE   " + "   ·   ".join(parts), F("Medium", 32), anchor="ma")
+    T((W // 2, 1400), f'Updated {now.strftime("%a %b")} {now.day} · {fmt_time(now)}', F("Regular", 24), fill=90, anchor="ma")
+    return im
+
+
 def main():
     global FIXTURES
     ap = argparse.ArgumentParser()
@@ -588,9 +760,10 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     now = now_local()
 
-    weather = surf = tides = news = events = None
+    weather = surf = tides = news = events = school = None
     for label, fn in (("weather", lambda: get_weather(now)), ("surf", get_surf), ("tides", lambda: get_tides(now)),
-                      ("news", get_news), ("calendar", lambda: get_calendar(now))):
+                      ("news", get_news), ("calendar", lambda: get_calendar(now)),
+                      ("school", lambda: get_school(now))):
         try:
             val = fn()
         except Exception as e:  # noqa: BLE001
@@ -600,6 +773,7 @@ def main():
         elif label == "surf": surf = val
         elif label == "tides": tides = val
         elif label == "news": news = val
+        elif label == "school": school = val
         else: events = val
         print(f"[{label}] {'ok' if val is not None else 'UNAVAILABLE'}")
 
@@ -607,7 +781,9 @@ def main():
              ("02-week.png", lambda n, t: page_week(now, weather, tides, n, t))]
     if os.environ.get("CAL_ICS_URL") or FIXTURES:
         pages.append(("03-calendar.png", lambda n, t: page_calendar(now, events, n, t)))
-    pages.append(("04-news.png", lambda n, t: page_news(now, news, n, t)))
+    if school is not None:  # skip the page entirely if the feed is down, rather than publish an error page
+        pages.append(("04-school.png", lambda n, t: page_school(now, school, n, t)))
+    pages.append(("05-news.png", lambda n, t: page_news(now, news, n, t)))
 
     pdf_pages = []
     manifest = {"generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -627,6 +803,17 @@ def main():
     with open(pdf_path, "rb") as f:
         manifest["sha256"]["00-dashboard.pdf"] = hashlib.sha256(f.read()).hexdigest()
     manifest["pages"].insert(0, "00-dashboard.pdf")
+    # Lock-screen image (served separately; the Kindle puts it in its own sleep-screen folder).
+    try:
+        lock = page_lock(now, weather, surf, tides)
+        lock_name = "lock-01.png"
+        lock_path = os.path.join(a.out, lock_name)
+        lock.save(lock_path, optimize=True)
+        with open(lock_path, "rb") as f:
+            manifest["sha256"][lock_name] = hashlib.sha256(f.read()).hexdigest()
+        manifest["pages"].append(lock_name)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] lock screen failed: {type(e).__name__}: {e}", file=sys.stderr)
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
     # Fail the build only if nothing useful came back at all (so a stale page isn't published over a good one).
